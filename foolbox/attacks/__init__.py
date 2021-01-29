@@ -39,7 +39,10 @@ from .contrast_min import (  # noqa: F401
     BinarySearchContrastReductionAttack,
     LinearSearchContrastReductionAttack,
 )
-from .carlini_wagner import L2CarliniWagnerAttack  # noqa: F401
+from .carlini_wagner import ( # noqa: F401
+    L2CarliniWagnerAttack,
+    LinfCarliniWagnerAttack,
+)
 from .newtonfool import NewtonFoolAttack  # noqa: F401
 from .ead import EADAttack  # noqa: F401
 from .blur import GaussianBlurAttack  # noqa: F401

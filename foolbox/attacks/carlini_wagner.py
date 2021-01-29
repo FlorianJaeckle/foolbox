@@ -215,6 +215,9 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
             https://arxiv.org/abs/1608.04644
     """
     # check whether any more changes need to be done for l infinity
+    # official python code: https://github.com/carlini/nn_robust_attacks/blob/master/li_attack.py
+    # the current implementation doesn't work because taking the gradient at linf is not very helpful
+    # support early stopping as soon as our eps is less than the target
 
     distance = linf
 
@@ -304,8 +307,10 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
             is_adv_loss = ep.maximum(0, is_adv_loss)
             is_adv_loss = is_adv_loss * consts
 
-            squared_norms = flatten(x - reconstsructed_x).square().sum(axis=-1)
-            loss = is_adv_loss.sum() + squared_norms.sum()
+            # squared_norms = flatten(x - reconstsructed_x).square().sum(axis=-1)
+            linf_norms = flatten(x - reconstsructed_x).abs().max(axis=-1)
+            # loss = is_adv_loss.sum() + squared_norms.sum()
+            loss = is_adv_loss.sum() + linf_norms.sum()
             return loss, (x, logits)
 
         loss_aux_and_grad = ep.value_and_grad_fn(x, loss_fun, has_aux=True)
@@ -327,6 +332,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                 consts = np.minimum(upper_bounds, 1e10)
 
             # create a new optimizer find the delta that minimizes the loss
+            # initialized to all zeros
             delta = ep.zeros_like(x_attack)
             optimizer = AdamOptimizer(delta)
 
@@ -336,8 +342,13 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
 
             consts_ = ep.from_numpy(x, consts.astype(np.float32))
 
+            print('consts', consts_)
+
             for step in range(self.steps):
+                # delta is the current perturbation - we call loss_aux_and_grad to get a new gradient
+                # as well as the current new image and loss (from a pytorch package instead of autograd)
                 loss, (perturbed, logits), gradient = loss_aux_and_grad(delta, consts_)
+                # we update the current perturbation using the gradient and the adam optimizer
                 delta += optimizer(gradient, self.stepsize)
 
                 if self.abort_early and step % (np.ceil(self.steps / 10)) == 0:
@@ -350,6 +361,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                 found_advs = np.logical_or(found_advs, found_advs_iter.numpy())
 
                 norms = flatten(perturbed - x).norms.linf(axis=-1)
+                # print("norns", norms)
                 closer = norms < best_advs_norms
                 new_best = ep.logical_and(closer, found_advs_iter)
 
@@ -365,7 +377,9 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
             consts = np.where(
                 np.isinf(upper_bounds), consts_exponential_search, consts_binary_search
             )
+            print("best_advs", best_advs_norms)
 
+        print("best_advs", best_advs_norms)
         return restore_type(best_advs)
 
 
