@@ -199,15 +199,16 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
     """Implementation of the Carlini & Wagner Ling Attack. [#Carl16]_
 
     Args:
-        binary_search_steps : Number of steps to perform in the binary search
-            over the const c.
         steps : Number of optimization steps within each binary search step.
         stepsize : Stepsize to update the examples.
-        confidence : Confidence required for an example to be marked as adversarial.
-            Controls the gap between example and decision boundary.
         initial_const : Initial value of the const c with which the binary search starts.
+        largest_const : the largest value of c to go up to before giving up
         abort_early : Stop inner search as soons as an adversarial example has been found.
             Does not affect the binary search over the const c.
+        decrease_factor: 0<f<1, rate at which we shrink tau; larger is more accurate
+        reduce_const: try to lower c each iteration; faster to set to false
+        const_factor : f>1, rate at which we increase constant, smaller better
+
 
     References:
         .. [#Carl16] Nicholas Carlini, David Wagner, "Towards evaluating the robustness of
@@ -223,19 +224,23 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
 
     def __init__(
         self,
-        binary_search_steps: int = 9,
         steps: int = 10000,
-        stepsize: float = 1e-2,
-        confidence: float = 0,
-        initial_const: float = 1e-3,
+        stepsize: float = 1e-3,
+        initial_const: float = 1e-5,
+        largest_const: float = 2e+1,
         abort_early: bool = True,
+        decrease_factor: float = 0.9,
+        reduce_const: bool = False,
+        const_factor: float = 2.0,
     ):
-        self.binary_search_steps = binary_search_steps
         self.steps = steps
         self.stepsize = stepsize
-        self.confidence = confidence
         self.initial_const = initial_const
+        self.largest_const = largest_const
         self.abort_early = abort_early
+        self.decrease_factor = decrease_factor
+        self.reduce_const = reduce_const
+        self.const_factor = const_factor
 
     def run(
         self,
@@ -285,7 +290,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         rows = range(N)
 
         def loss_fun(
-            delta: ep.Tensor, consts: ep.Tensor
+            delta: ep.Tensor, consts: ep.Tensor, tau: ep.Tensor
         ) -> Tuple[ep.Tensor, Tuple[ep.Tensor, ep.Tensor]]:
             assert delta.shape == x_attack.shape
             assert consts.shape == (N,)
@@ -307,9 +312,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
             is_adv_loss = ep.maximum(0, is_adv_loss)
             is_adv_loss = is_adv_loss * consts
 
-            # squared_norms = flatten(x - reconstsructed_x).square().sum(axis=-1)
-            linf_norms = flatten(x - reconstsructed_x).abs().max(axis=-1)
-            # loss = is_adv_loss.sum() + squared_norms.sum()
+            linf_norms = (flatten(x - reconstsructed_x).abs() - tau).clamp(min=0).sum(axis=1)
             loss = is_adv_loss.sum() + linf_norms.sum()
             return loss, (x, logits)
 
@@ -322,62 +325,73 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         best_advs = ep.zeros_like(x)
         best_advs_norms = ep.full(x, (N,), ep.inf)
 
-        # the binary search searches for the smallest consts that produce adversarials
-        for binary_search_step in range(self.binary_search_steps):
-            if (
-                binary_search_step == self.binary_search_steps - 1
-                and self.binary_search_steps >= 10
-            ):
-                # in the last binary search step, repeat the search once
-                consts = np.minimum(upper_bounds, 1e10)
+        # we gradually reduce tau
+        while tau > 1./256:
+            # try to solve given this tau value
 
-            # create a new optimizer find the delta that minimizes the loss
-            # initialized to all zeros
-            delta = ep.zeros_like(x_attack)
-            optimizer = AdamOptimizer(delta)
+            # the binary search searches for the smallest consts that produce adversarials
+            while const < self.largest_const:
 
-            # tracks whether adv with the current consts was found
-            found_advs = np.full((N,), fill_value=False)
-            loss_at_previous_check = np.inf
+                # create a new optimizer find the delta that minimizes the loss
+                # initialized to all zeros
+                delta = ep.zeros_like(x_attack)
+                optimizer = AdamOptimizer(delta)
 
-            consts_ = ep.from_numpy(x, consts.astype(np.float32))
+                # tracks whether adv with the current consts was found
+                found_advs = np.full((N,), fill_value=False)
+                loss_at_previous_check = np.inf
 
-            print('consts', consts_)
+                consts_ = ep.from_numpy(x, consts.astype(np.float32))
 
-            for step in range(self.steps):
-                # delta is the current perturbation - we call loss_aux_and_grad to get a new gradient
-                # as well as the current new image and loss (from a pytorch package instead of autograd)
-                loss, (perturbed, logits), gradient = loss_aux_and_grad(delta, consts_)
-                # we update the current perturbation using the gradient and the adam optimizer
-                delta += optimizer(gradient, self.stepsize)
+                print('consts', consts_)
 
-                if self.abort_early and step % (np.ceil(self.steps / 10)) == 0:
-                    # after each tenth of the overall steps, check progress
-                    if not (loss <= 0.9999 * loss_at_previous_check):
-                        break  # stop Adam if there has been no progress
-                    loss_at_previous_check = loss
+                for step in range(self.steps):
+                    # delta is the current perturbation - we call loss_aux_and_grad to get a new gradient
+                    # as well as the current new image and loss (from a pytorch package instead of autograd)
+                    loss, (perturbed, logits), gradient = loss_aux_and_grad(delta, consts_, tau)
+                    # we update the current perturbation using the gradient and the adam optimizer
+                    delta += optimizer(gradient, self.stepsize)
 
-                found_advs_iter = is_adversarial(perturbed, logits)
-                found_advs = np.logical_or(found_advs, found_advs_iter.numpy())
+                    if self.abort_early and step % (np.ceil(self.steps / 10)) == 0:
+                        # TODO check whether this is true not just for l2 but also linf
+                        # after each tenth of the overall steps, check progress
+                        if not (loss <= 0.9999 * loss_at_previous_check):
+                            break  # stop Adam if there has been no progress
+                        loss_at_previous_check = loss
 
-                norms = flatten(perturbed - x).norms.linf(axis=-1)
-                # print("norns", norms)
-                closer = norms < best_advs_norms
-                new_best = ep.logical_and(closer, found_advs_iter)
+                    found_advs_iter = is_adversarial(perturbed, logits)
+                    found_advs = np.logical_or(found_advs, found_advs_iter.numpy())
 
-                new_best_ = atleast_kd(new_best, best_advs.ndim)
-                best_advs = ep.where(new_best_, perturbed, best_advs)
-                best_advs_norms = ep.where(new_best, norms, best_advs_norms)
+                    norms = flatten(perturbed - x).norms.linf(axis=-1)
+                    # print("norns", norms)
+                    closer = norms < best_advs_norms
+                    new_best = ep.logical_and(closer, found_advs_iter)
 
-            upper_bounds = np.where(found_advs, consts, upper_bounds)
-            lower_bounds = np.where(found_advs, lower_bounds, consts)
+                    new_best_ = atleast_kd(new_best, best_advs.ndim)
+                    best_advs = ep.where(new_best_, perturbed, best_advs)
+                    best_advs_norms = ep.where(new_best, norms, best_advs_norms)
 
-            consts_exponential_search = consts * 10
-            consts_binary_search = (lower_bounds + upper_bounds) / 2
-            consts = np.where(
-                np.isinf(upper_bounds), consts_exponential_search, consts_binary_search
-            )
-            print("best_advs", best_advs_norms)
+                upper_bounds = np.where(found_advs, consts, upper_bounds)
+                lower_bounds = np.where(found_advs, lower_bounds, consts)
+
+                consts *= self.const_factor
+
+                print("best_advs", best_advs_norms)
+
+            if self.reduce_const:
+                consts = const/2
+
+            actualtau = norms.max()
+
+            if actualtau < tau:
+                tau = actualtau
+
+            print("Tau", tau)
+
+            # TODO warm start grad
+            # prev = nimg
+
+            tau *= self.decrease_factor
 
         print("best_advs", best_advs_norms)
         return restore_type(best_advs)
