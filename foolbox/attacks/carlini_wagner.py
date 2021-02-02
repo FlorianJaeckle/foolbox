@@ -324,12 +324,12 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         tau = 1.0
 
         # we gradually reduce tau
-        while tau > 1./256:
+        while tau > 1./10:  # in the original code this was `while tau > 1./256` but seems pointless for our case to decrease tau that much
             # try to solve given this tau value
 
+            succ = False  # flag indicating whether have found a counter example
             # the binary search searches for the smallest consts that produce adversarials
             while const < self.largest_const:
-
                 # create a new optimizer find the delta that minimizes the loss
                 # initialized to all zeros
                 delta = ep.zeros_like(x_attack)
@@ -351,13 +351,6 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                     # we update the current perturbation using the gradient and the adam optimizer
                     delta += optimizer(gradient, self.stepsize)
 
-                    if self.abort_early and step % (np.ceil(self.steps / 10)) == 0:
-                        # TODO check whether this is true not just for l2 but also linf
-                        # after each tenth of the overall steps, check progress
-                        if not (loss <= 0.9999 * loss_at_previous_check):
-                            break  # stop Adam if there has been no progress
-                        loss_at_previous_check = loss
-
                     found_advs_iter = is_adversarial(perturbed, logits)
                     found_advs = np.logical_or(found_advs, found_advs_iter.numpy())
 
@@ -370,13 +363,24 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                     best_advs = ep.where(new_best_, perturbed, best_advs)
                     best_advs_norms = ep.where(new_best, norms, best_advs_norms)
 
+                    if self.abort_early and loss < 0.0001*const:
+                        works = is_adversarial(perturbed, logits)
+                        if ep.min(works):
+                            succ = True
+                            break
+
+                if succ:
+                    break
+
                 upper_bounds = np.where(found_advs, const, upper_bounds)
                 lower_bounds = np.where(found_advs, lower_bounds, const)
 
                 const *= self.const_factor
 
-                if closer.sum()>0:
-                    print("best_advs", best_advs_norms)
+                print("best_advs", best_advs_norms)
+
+            if not succ:
+                break
 
             if self.reduce_const:
                 const = const/2
