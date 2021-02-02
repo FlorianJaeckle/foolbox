@@ -2,6 +2,7 @@ from typing import Union, Tuple, Any, Optional
 from functools import partial
 import numpy as np
 import eagerpy as ep
+# import torch
 
 from ..devutils import flatten
 from ..devutils import atleast_kd
@@ -265,13 +266,10 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         elif isinstance(criterion_, TargetedMisclassification):
             targeted = True
             classes = criterion_.target_classes
-            change_classes_logits = -self.confidence
         else:
             raise ValueError("unsupported criterion")
 
         def is_adversarial(perturbed: ep.Tensor, logits: ep.Tensor) -> ep.Tensor:
-            if change_classes_logits != 0:
-                logits += ep.onehot_like(logits, classes, value=change_classes_logits)
             return criterion_(perturbed, logits)
 
         if classes.shape != (N,):
@@ -293,7 +291,6 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
             delta: ep.Tensor, consts: ep.Tensor, tau: ep.Tensor
         ) -> Tuple[ep.Tensor, Tuple[ep.Tensor, ep.Tensor]]:
             assert delta.shape == x_attack.shape
-            assert consts.shape == (N,)
 
             x = to_model_space(x_attack + delta)
             logits = model(x)
@@ -308,22 +305,23 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
             is_adv_loss = logits[rows, c_minimize] - logits[rows, c_maximize]
             assert is_adv_loss.shape == (N,)
 
-            is_adv_loss = is_adv_loss + self.confidence
             is_adv_loss = ep.maximum(0, is_adv_loss)
             is_adv_loss = is_adv_loss * consts
 
-            linf_norms = (flatten(x - reconstsructed_x).abs() - tau).clamp(min=0).sum(axis=1)
+            linf_norms = ep.clip((flatten(x - reconstsructed_x).abs() - tau), min_=0, max_=None).sum(axis=1)
             loss = is_adv_loss.sum() + linf_norms.sum()
             return loss, (x, logits)
 
         loss_aux_and_grad = ep.value_and_grad_fn(x, loss_fun, has_aux=True)
 
-        consts = self.initial_const * np.ones((N,))
+        const = self.initial_const
         lower_bounds = np.zeros((N,))
         upper_bounds = np.inf * np.ones((N,))
 
         best_advs = ep.zeros_like(x)
         best_advs_norms = ep.full(x, (N,), ep.inf)
+
+        tau = 1.0
 
         # we gradually reduce tau
         while tau > 1./256:
@@ -341,9 +339,10 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                 found_advs = np.full((N,), fill_value=False)
                 loss_at_previous_check = np.inf
 
-                consts_ = ep.from_numpy(x, consts.astype(np.float32))
+                # consts_ = ep.from_numpy(x, const.astype(np.float32))
+                consts_ = const
 
-                print('consts', consts_)
+                print('consts', consts_, end="\r")
 
                 for step in range(self.steps):
                     # delta is the current perturbation - we call loss_aux_and_grad to get a new gradient
@@ -371,15 +370,16 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                     best_advs = ep.where(new_best_, perturbed, best_advs)
                     best_advs_norms = ep.where(new_best, norms, best_advs_norms)
 
-                upper_bounds = np.where(found_advs, consts, upper_bounds)
-                lower_bounds = np.where(found_advs, lower_bounds, consts)
+                upper_bounds = np.where(found_advs, const, upper_bounds)
+                lower_bounds = np.where(found_advs, lower_bounds, const)
 
-                consts *= self.const_factor
+                const *= self.const_factor
 
-                print("best_advs", best_advs_norms)
+                if closer.sum()>0:
+                    print("best_advs", best_advs_norms)
 
             if self.reduce_const:
-                consts = const/2
+                const = const/2
 
             actualtau = norms.max()
 
