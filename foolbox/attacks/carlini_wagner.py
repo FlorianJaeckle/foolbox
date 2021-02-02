@@ -197,6 +197,7 @@ class L2CarliniWagnerAttack(MinimizationAttack):
 
 
 class LinfCarliniWagnerAttack(MinimizationAttack):
+    # NOTE: WORK IN PROGRESS, DO NOT USE YET
     """Implementation of the Carlini & Wagner Ling Attack. [#Carl16]_
 
     Args:
@@ -220,6 +221,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
     # official python code: https://github.com/carlini/nn_robust_attacks/blob/master/li_attack.py
     # the current implementation doesn't work because taking the gradient at linf is not very helpful
     # support early stopping as soon as our eps is less than the target
+    # maybe add random initialization rather than setting delta to all zeros
 
     distance = linf
 
@@ -242,6 +244,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         self.decrease_factor = decrease_factor
         self.reduce_const = reduce_const
         self.const_factor = const_factor
+        self.warm_start = True
 
     def run(
         self,
@@ -321,18 +324,23 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         best_advs = ep.zeros_like(x)
         best_advs_norms = ep.full(x, (N,), ep.inf)
 
+        # perturbation initialized to all zeros
+        delta = ep.zeros_like(x_attack)
+
         tau = 1.0
 
         # we gradually reduce tau
         while tau > 1./10:  # in the original code this was `while tau > 1./256` but seems pointless for our case to decrease tau that much
             # try to solve given this tau value
+            print(f"tau: {tau}, const: {const}")
 
-            succ = False  # flag indicating whether have found a counter example
+            succ = False  # flag indicating whether the current attack was successful
             # the binary search searches for the smallest consts that produce adversarials
             while const < self.largest_const:
-                # create a new optimizer find the delta that minimizes the loss
-                # initialized to all zeros
-                delta = ep.zeros_like(x_attack)
+                if not self.warm_start:
+                    # initialized to all zeros
+                    delta = ep.zeros_like(x_attack)
+                # create a new optimizer find the delta that minimizes the loss --- maybe warm start the optimizer as well?
                 optimizer = AdamOptimizer(delta)
 
                 # tracks whether adv with the current consts was found
@@ -355,7 +363,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                     found_advs = np.logical_or(found_advs, found_advs_iter.numpy())
 
                     norms = flatten(perturbed - x).norms.linf(axis=-1)
-                    # print("norns", norms)
+
                     closer = norms < best_advs_norms
                     new_best = ep.logical_and(closer, found_advs_iter)
 
@@ -366,6 +374,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                     if self.abort_early and loss < 0.0001*const:
                         works = is_adversarial(perturbed, logits)
                         if ep.min(works):
+                            # the attack for the given tau worked
                             succ = True
                             break
 
@@ -375,12 +384,16 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                 upper_bounds = np.where(found_advs, const, upper_bounds)
                 lower_bounds = np.where(found_advs, lower_bounds, const)
 
+                # we didn't succeed, increase constant and try again
                 const *= self.const_factor
 
                 print("best_advs", best_advs_norms)
 
             if not succ:
+                # the last attack failed so we return our latest answer
                 break
+
+            # the attack succeeded, reduce tau and try again
 
             if self.reduce_const:
                 const = const/2
@@ -389,8 +402,6 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
 
             if actualtau < tau:
                 tau = actualtau
-
-            print("Tau", tau)
 
             # TODO warm start grad
             # prev = nimg
