@@ -3,6 +3,7 @@ from functools import partial
 import numpy as np
 import eagerpy as ep
 # import torch
+import time
 
 from ..devutils import flatten
 from ..devutils import atleast_kd
@@ -255,7 +256,11 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         early_stop: Optional[float] = None,
         **kwargs: Any,
     ) -> T:
-        raise_if_kwargs(kwargs)
+        if 'eps' in kwargs.keys():
+            eps_needed = kwargs['eps']
+        else:
+            eps_needed = None
+        # raise_if_kwargs(kwargs)
         x, restore_type = ep.astensor_(inputs)
         criterion_ = get_criterion(criterion)
         del inputs, criterion, kwargs
@@ -328,15 +333,17 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
         delta = ep.zeros_like(x_attack)
 
         tau = 1.0
+        timeout = 100
+        time_start = time.time()
 
         # we gradually reduce tau
-        while tau > 1./10:  # in the original code this was `while tau > 1./256` but seems pointless for our case to decrease tau that much
+        while tau > 1./10 and time.time()-time_start < timeout:  # in the original code this was `while tau > 1./256` but seems pointless for our case to decrease tau that much
             # try to solve given this tau value
-            print(f"tau: {tau}, const: {const}")
+            # print(f"tau: {tau}, const: {const}")
 
             succ = False  # flag indicating whether the current attack was successful
             # the binary search searches for the smallest consts that produce adversarials
-            while const < self.largest_const:
+            while const < self.largest_const and time.time()-time_start < timeout:
                 if not self.warm_start:
                     # initialized to all zeros
                     delta = ep.zeros_like(x_attack)
@@ -350,7 +357,7 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                 # consts_ = ep.from_numpy(x, const.astype(np.float32))
                 consts_ = const
 
-                print('consts', consts_, end="\r")
+                # print('consts', consts_, end="\r")
 
                 for step in range(self.steps):
                     # delta is the current perturbation - we call loss_aux_and_grad to get a new gradient
@@ -387,11 +394,19 @@ class LinfCarliniWagnerAttack(MinimizationAttack):
                 # we didn't succeed, increase constant and try again
                 const *= self.const_factor
 
-                print("best_advs", best_advs_norms)
+            # print("best_advs", best_advs_norms)
 
             if not succ:
                 # the last attack failed so we return our latest answer
                 break
+
+
+            if eps_needed:
+                # print(best_advs_norms, eps_needed)
+                if best_advs_norms < eps_needed:
+                    print("\nsuccess in CW\n")
+                    return restore_type(best_advs)
+                    break
 
             # the attack succeeded, reduce tau and try again
 
